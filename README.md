@@ -46,17 +46,25 @@ Ejemplo de entrada de hook:
 
 ## Uso
 
-Tres formas de arrancar Blip:
+La forma recomendada es el ejecutable **`Blip.exe`**: doble clic y listo, sin
+depender de Python instalado. Lanza solo una instancia a la vez (si la abres
+de nuevo, se restaura la ventana existente en vez de duplicarla).
 
-1. **Doble clic** en `Blip.vbs` — arranca sin ventana de consola. Puedes
-   crear un acceso directo y ponerlo en el Escritorio o la barra de tareas.
-2. **Sin consola desde terminal:**
-   ```bash
-   pythonw app.py
-   ```
-3. **Con consola (para depurar):**
-   ```bash
-   python app.py
-   ```
+Para desarrollo también puedes lanzarla directamente:
 
-Lanza solo una instancia a la vez.
+```bash
+python app.py       # con consola (útil para depurar)
+pythonw app.py      # sin consola
+```
+
+## Empaquetar el ejecutable
+
+Cada vez que cambies `app.py` y quieras regenerar `Blip.exe`, ejecuta:
+
+```bash
+build.bat
+```
+
+Esto usa PyInstaller (`pip install pyinstaller`) para crear un `Blip.exe`
+autónomo y lo copia a la raíz del proyecto. El `.exe` y los artefactos de
+build (`build/`, `dist/`, `*.spec`) están en `.gitignore`.

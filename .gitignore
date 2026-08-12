@@ -5,10 +5,11 @@ __pycache__/
 .venv/
 venv/
 
-# PyInstaller
+# PyInstaller / packaged build
 build/
 dist/
 *.spec
+*.exe
 
 # Editor
 .vscode/
