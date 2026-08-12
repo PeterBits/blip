@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QScrollArea,
+    QFrame,
 )
 
 
@@ -192,7 +193,7 @@ class StarButton(QLabel):
 
     def __init__(self):
         super().__init__()
-        self.setFixedWidth(20)
+        self.setFixedWidth(18)
         self.setAlignment(Qt.AlignCenter)
         self.setCursor(Qt.PointingHandCursor)
         self._fav = False
@@ -208,12 +209,13 @@ class StarButton(QLabel):
         self.render()
 
     def render(self) -> None:
+        # Tamano de estrella reducido un 20% (15px -> 12px).
         if self._fav:
             self.setText("★")  # estrella rellena
-            self.setStyleSheet("color: #f1c40f; font-size: 15px;")
+            self.setStyleSheet("color: #f1c40f; font-size: 12px;")
         elif self._hover_row:
             self.setText("☆")  # estrella vacia
-            self.setStyleSheet("color: #7f8c8d; font-size: 15px;")
+            self.setStyleSheet("color: #7f8c8d; font-size: 12px;")
         else:
             self.setText("")
 
@@ -221,6 +223,24 @@ class StarButton(QLabel):
         if event.button() == Qt.LeftButton:
             self.clicked.emit()
         super().mousePressEvent(event)
+
+
+class Divider(QWidget):
+    """Separador sutil entre las favoritas y el resto de sesiones.
+
+    Una linea fina con un poco de aire arriba y abajo.
+    """
+
+    def __init__(self):
+        super().__init__()
+        box = QVBoxLayout(self)
+        box.setContentsMargins(14, 5, 14, 5)
+        box.setSpacing(0)
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFixedHeight(1)
+        line.setStyleSheet("background: #33414d; border: none;")
+        box.addWidget(line)
 
 
 class SessionRow(QWidget):
@@ -233,21 +253,34 @@ class SessionRow(QWidget):
         self.setObjectName("row")
         # Seguir el raton para mostrar la estrella al hacer hover.
         self.setAttribute(Qt.WA_Hover, True)
+        # Toda la fila es clicable (doble clic = favorita) -> cursor de mano.
+        self.setCursor(Qt.PointingHandCursor)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 8, 8, 8)
         layout.setSpacing(10)
 
         self.dot = LightDot()
 
-        # Bloque de texto: repo en negrita arriba, titulo debajo.
+        # Bloque de texto: (repo + estrella) arriba, titulo debajo.
         text_box = QVBoxLayout()
         text_box.setSpacing(1)
         text_box.setContentsMargins(0, 0, 0, 0)
+
+        # Fila del nombre: nombre de la carpeta + estrella justo a su derecha.
+        name_row = QHBoxLayout()
+        name_row.setSpacing(6)
+        name_row.setContentsMargins(0, 0, 0, 0)
         self.repo = QLabel("-")
         self.repo.setStyleSheet("color: #ecf0f1; font-size: 13px; font-weight: 600;")
+        self.star = StarButton()
+        self.star.clicked.connect(self.fav_toggled)
+        name_row.addWidget(self.repo)
+        name_row.addWidget(self.star)
+        name_row.addStretch()
+
         self.title = QLabel("")
         self.title.setStyleSheet("color: #9aa5ad; font-size: 11px;")
-        text_box.addWidget(self.repo)
+        text_box.addLayout(name_row)
         text_box.addWidget(self.title)
 
         # Bloque derecho: estado arriba, tiempo debajo.
@@ -263,13 +296,14 @@ class SessionRow(QWidget):
         right_box.addWidget(self.status)
         right_box.addWidget(self.age)
 
-        self.star = StarButton()
-        self.star.clicked.connect(self.fav_toggled)
-
         layout.addWidget(self.dot)
         layout.addLayout(text_box, 1)
         layout.addLayout(right_box)
-        layout.addWidget(self.star)
+
+        # Propagar el cursor de mano a los hijos, para que el pointer se vea
+        # en todo el ancho de la fila (los QLabel no lo heredan por defecto).
+        for w in (self.dot, self.repo, self.title, self.status, self.age):
+            w.setCursor(Qt.PointingHandCursor)
 
     def enterEvent(self, event) -> None:
         self.star.set_row_hover(True)
@@ -278,6 +312,12 @@ class SessionRow(QWidget):
     def leaveEvent(self, event) -> None:
         self.star.set_row_hover(False)
         super().leaveEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        # Doble clic en cualquier parte de la fila -> marcar/desmarcar favorita.
+        if event.button() == Qt.LeftButton:
+            self.fav_toggled.emit()
+        super().mouseDoubleClickEvent(event)
 
     def update_from(self, data: dict, stale: bool, age_seconds: float,
                     favorite: bool = False) -> None:
@@ -366,6 +406,11 @@ class MainWindow(QWidget):
         # este abierta). Las favoritas van siempre arriba de la lista.
         self.favorites: set[str] = set()
 
+        # Separador entre favoritas y el resto (se muestra solo si hay ambos).
+        self.divider = Divider()
+        self.divider.hide()
+        self.list_layout.insertWidget(0, self.divider)
+
         # Timer de estado: relee los ficheros y actualiza colores/orden.
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -439,8 +484,18 @@ class MainWindow(QWidget):
         # esperando primero. 'is not fav' -> False(0) ordena antes que True(1).
         active.sort(key=lambda t: (t[1] not in self.favorites, t[0], -t[4]))
 
+        # ¿Cuantas favoritas hay al principio? (active ya viene ordenado con
+        # las favoritas delante). El separador ira tras la ultima favorita.
+        n_fav = sum(1 for (_o, sid, *_r) in active if sid in self.favorites)
+        n_total = len(active)
+        show_divider = 0 < n_fav < n_total  # solo si hay favoritas Y no favoritas
+
+        # Sacar el divisor del layout para recolocarlo (o esconderlo).
+        self.list_layout.removeWidget(self.divider)
+
         # Crear/actualizar filas y recolocarlas en el orden calculado.
-        for position, (order, sid, data, stale, age) in enumerate(active):
+        pos = 0
+        for idx, (order, sid, data, stale, age) in enumerate(active):
             row = self.rows.get(sid)
             if row is None:
                 row = SessionRow()
@@ -450,7 +505,14 @@ class MainWindow(QWidget):
             row.update_from(data, stale, age, favorite=sid in self.favorites)
             # Reubicar en la posicion correcta (quitar y reinsertar).
             self.list_layout.removeWidget(row)
-            self.list_layout.insertWidget(position, row)
+            self.list_layout.insertWidget(pos, row)
+            pos += 1
+            # Tras la ultima favorita, colocar el separador.
+            if show_divider and idx == n_fav - 1:
+                self.list_layout.insertWidget(pos, self.divider)
+                pos += 1
+
+        self.divider.setVisible(show_divider)
 
         # Quitar filas de sesiones cuyo fichero ya no existe.
         for sid in list(self.rows.keys()):
