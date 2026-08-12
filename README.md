@@ -16,7 +16,7 @@ resto. Las sesiones cuya terminal se cierra desaparecen solas.
 
 1. Un **hook** de Claude Code (`hooks/report_state.py`) se dispara en cada
    evento de la sesión (inicio, uso de herramienta, notificación, fin...) y
-   escribe el estado en `~/.claude/ia-alert/<session_id>.json`.
+   escribe el estado en `~/.claude/blip/<session_id>.json`.
 2. La **app** (`app.py`, PySide6) vigila esa carpeta y pinta el semáforo.
 
 ## Instalación
@@ -37,7 +37,7 @@ Ejemplo de entrada de hook:
   "hooks": {
     "Stop": [
       { "matcher": "*", "hooks": [
-        { "type": "command", "command": "python \"D:\\DEV\\ia_alert\\hooks\\report_state.py\"", "async": true }
+        { "type": "command", "command": "python \"D:\\DEV\\blip\\hooks\\report_state.py\"", "async": true }
       ]}
     ]
   }

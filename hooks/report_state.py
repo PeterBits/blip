@@ -1,11 +1,11 @@
 """
-Hook de Claude Code: reporta el estado de la sesion a IA-Alert.
+Hook de Claude Code: reporta el estado de la sesion a Blip.
 
 Se invoca desde ~/.claude/settings.json en los eventos:
   SessionStart / UserPromptSubmit / PreToolUse / Notification / Stop / SessionEnd
 
 Lee el JSON del evento por stdin y escribe un fichero de estado en:
-  ~/.claude/ia-alert/<session_id>.json
+  ~/.claude/blip/<session_id>.json
 
 La app de escritorio vigila esa carpeta y pinta el semaforo:
   green  -> trabajando
@@ -39,7 +39,7 @@ EVENT_TO_STATE = {
     "SubagentStop": "green",  # un subagente termino, pero la sesion sigue trabajando
 }
 
-STATE_DIR = Path.home() / ".claude" / "ia-alert"
+STATE_DIR = Path.home() / ".claude" / "blip"
 
 # Herramientas que, al iniciarse, significan "Claude espera que el usuario
 # decida algo" (menus de opciones, elicitaciones). Cuando PreToolUse las

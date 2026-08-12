@@ -1,7 +1,7 @@
 """
 Blip: monitor de escritorio para sesiones de Claude Code.
 
-Vigila la carpeta ~/.claude/ia-alert/ donde los hooks escriben el estado
+Vigila la carpeta ~/.claude/blip/ donde los hooks escriben el estado
 de cada sesion y muestra un semaforo al lado del nombre de cada terminal:
 
     verde    -> trabajando
@@ -54,7 +54,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
 )
 
-STATE_DIR = Path.home() / ".claude" / "ia-alert"
+STATE_DIR = Path.home() / ".claude" / "blip"
 
 # Si una sesion no se actualiza en este tiempo, se considera obsoleta.
 STALE_SECONDS = 60 * 30  # 30 min
