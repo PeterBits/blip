@@ -281,13 +281,6 @@ class MainWindow(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        header = QLabel("  Sesiones de Claude Code")
-        header.setStyleSheet(
-            "color: #dfe6e9; font-size: 13px; font-weight: 700;"
-            "padding: 10px; background: #2d3436;"
-        )
-        root.addWidget(header)
-
         self.empty = QLabel("  Sin sesiones activas")
         self.empty.setStyleSheet("color: #636e72; font-size: 12px; padding: 16px;")
         root.addWidget(self.empty)
