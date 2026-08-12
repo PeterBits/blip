@@ -44,7 +44,7 @@ def pid_alive(pid: int) -> bool:
         return True
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QPainter
+from PySide6.QtGui import QColor, QPainter, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -53,6 +53,23 @@ from PySide6.QtWidgets import (
     QLabel,
     QScrollArea,
 )
+
+
+def resource_path(rel: str) -> Path:
+    """Ruta a un recurso, tanto en desarrollo como dentro del .exe.
+
+    PyInstaller descomprime los datos en sys._MEIPASS al ejecutar el .exe;
+    en desarrollo el recurso esta junto a este fichero.
+    """
+    base = getattr(sys, "_MEIPASS", None)
+    root = Path(base) if base else Path(__file__).parent
+    return root / rel
+
+
+def app_icon() -> QIcon:
+    """Icono de Blip (circulo verde). Vacio si no se encuentra el fichero."""
+    ico = resource_path("assets/blip.ico")
+    return QIcon(str(ico)) if ico.exists() else QIcon()
 
 STATE_DIR = Path.home() / ".claude" / "blip"
 
@@ -214,6 +231,7 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Blip")
+        self.setWindowIcon(app_icon())
         # Always-on-top; ventana normal (se puede minimizar).
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         self.resize(340, 400)
@@ -365,6 +383,7 @@ def main() -> None:
     from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
     app = QApplication(sys.argv)
+    app.setWindowIcon(app_icon())
 
     # ¿Ya hay una instancia de Blip corriendo? Intentamos conectar al socket.
     probe = QLocalSocket()
