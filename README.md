@@ -46,8 +46,17 @@ Ejemplo de entrada de hook:
 
 ## Uso
 
-```bash
-python app.py
-```
+Tres formas de arrancar Blip:
 
-(Usa `pythonw app.py` para lanzarla sin ventana de consola.)
+1. **Doble clic** en `Blip.vbs` — arranca sin ventana de consola. Puedes
+   crear un acceso directo y ponerlo en el Escritorio o la barra de tareas.
+2. **Sin consola desde terminal:**
+   ```bash
+   pythonw app.py
+   ```
+3. **Con consola (para depurar):**
+   ```bash
+   python app.py
+   ```
+
+Lanza solo una instancia a la vez.
