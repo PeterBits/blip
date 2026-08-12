@@ -22,8 +22,12 @@ El `.exe` NO se versiona; se distribuye como **GitHub Release**:
 2. En GitHub: **Releases → Draft a new release**.
 3. Crea un tag (p. ej. `v1.0.0`), pon un título y descripción.
 4. Arrastra `dist/Blip.exe` a la zona de "Attach binaries".
+   **El fichero debe llamarse exactamente `Blip.exe`** (así lo genera
+   `build.bat`); si no, el botón de descarga directa no lo encontrará.
 5. Publica.
 
-El botón "Descargar" de la web apunta a
-`https://github.com/PeterBits/blip/releases/latest`, así que siempre
-enlaza a la última versión publicada sin tocar el HTML.
+Los botones "Descargar" de la web apuntan a
+`https://github.com/PeterBits/blip/releases/latest/download/Blip.exe`.
+Esa URL descarga el `Blip.exe` del último Release **directamente**, sin
+pasar por la página de releases, y siempre sirve la última versión sin
+tocar el HTML.
