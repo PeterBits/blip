@@ -342,11 +342,59 @@ class MainWindow(QWidget):
 
         self.empty.setVisible(not self.rows)
 
+    def bring_to_front(self) -> None:
+        """Restaura la ventana (si estaba minimizada) y la trae al frente.
+
+        Se invoca cuando una segunda instancia intenta abrirse: en vez de
+        crear otra ventana, reactivamos esta.
+        """
+        # Quitar el flag de minimizada conservando los demas estados.
+        self.setWindowState(
+            (self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive
+        )
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+
+# Nombre unico del socket local que actua de candado de instancia unica.
+SINGLE_INSTANCE_KEY = "blip-single-instance-pparra"
+
 
 def main() -> None:
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
+
     app = QApplication(sys.argv)
+
+    # ¿Ya hay una instancia de Blip corriendo? Intentamos conectar al socket.
+    probe = QLocalSocket()
+    probe.connectToServer(SINGLE_INSTANCE_KEY)
+    if probe.waitForConnected(300):
+        # Hay otra instancia viva: le pedimos que se muestre y salimos.
+        probe.write(b"show")
+        probe.waitForBytesWritten(300)
+        probe.disconnectFromServer()
+        return
+
+    # No habia servidor (o quedo huerfano de un cierre sucio). Limpiamos un
+    # posible socket residual y creamos el servidor de esta instancia.
+    QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
+    server = QLocalServer()
+    server.listen(SINGLE_INSTANCE_KEY)
+
     win = MainWindow()
     win.show()
+
+    def on_new_connection() -> None:
+        # Otra instancia nos pidio mostrarnos.
+        conn = server.nextPendingConnection()
+        if conn is not None:
+            conn.readyRead.connect(lambda: (conn.readAll(), win.bring_to_front()))
+            # Por si el dato ya llego, forzamos igualmente.
+            win.bring_to_front()
+
+    server.newConnection.connect(on_new_connection)
+
     sys.exit(app.exec())
 
 
