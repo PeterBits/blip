@@ -16,12 +16,9 @@ python -m PyInstaller --onefile --windowed --name Blip --noconfirm app.py
 if errorlevel 1 (
   echo.
   echo [Blip] ERROR: fallo el empaquetado. Revisa el mensaje de arriba.
-  pause
   exit /b 1
 )
 
 echo.
-echo [Blip] Listo. Blip.exe generado en:
+echo [Blip] Listo. Empaquetado disponible en:
 echo        %~dp0dist\Blip.exe
-echo.
-pause
