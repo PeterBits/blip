@@ -20,11 +20,8 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo [Blip] Copiando Blip.exe a la raiz del proyecto...
-copy /Y "dist\Blip.exe" "Blip.exe" >nul
-
 echo.
-echo [Blip] Listo. Blip.exe actualizado en:
-echo        %~dp0Blip.exe
+echo [Blip] Listo. Blip.exe generado en:
+echo        %~dp0dist\Blip.exe
 echo.
 pause

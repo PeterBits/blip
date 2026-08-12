@@ -46,9 +46,9 @@ Ejemplo de entrada de hook:
 
 ## Uso
 
-La forma recomendada es el ejecutable **`Blip.exe`**: doble clic y listo, sin
-depender de Python instalado. Lanza solo una instancia a la vez (si la abres
-de nuevo, se restaura la ventana existente en vez de duplicarla).
+La forma recomendada es el ejecutable **`dist\Blip.exe`**: doble clic y listo,
+sin depender de Python instalado. Lanza solo una instancia a la vez (si la
+abres de nuevo, se restaura la ventana existente en vez de duplicarla).
 
 Para desarrollo también puedes lanzarla directamente:
 
@@ -59,12 +59,12 @@ pythonw app.py      # sin consola
 
 ## Empaquetar el ejecutable
 
-Cada vez que cambies `app.py` y quieras regenerar `Blip.exe`, ejecuta:
+Cada vez que cambies `app.py` y quieras regenerar el ejecutable, ejecuta:
 
 ```bash
 build.bat
 ```
 
 Esto usa PyInstaller (`pip install pyinstaller`) para crear un `Blip.exe`
-autónomo y lo copia a la raíz del proyecto. El `.exe` y los artefactos de
-build (`build/`, `dist/`, `*.spec`) están en `.gitignore`.
+autónomo en **`dist\Blip.exe`**. El `.exe` y los artefactos de build
+(`build/`, `dist/`, `*.spec`) están en `.gitignore`.
