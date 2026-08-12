@@ -43,8 +43,8 @@ def pid_alive(pid: int) -> bool:
     except Exception:
         return True
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QPainter, QIcon
+from PySide6.QtCore import Qt, QTimer, QRectF
+from PySide6.QtGui import QColor, QPainter, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -82,6 +82,46 @@ COLORS = {
     "red": QColor("#e74c3c"),
     "gray": QColor("#7f8c8d"),
 }
+
+# Prioridad del icono de la barra de tareas: el estado mas urgente manda.
+# naranja (te necesita) > rojo (terminado) > verde (trabajando) > gris (nada).
+OVERALL_PRIORITY = ["yellow", "red", "green"]
+
+# Cache de iconos generados por color, para no redibujar en cada refresco.
+_icon_cache: dict = {}
+
+
+def state_icon(state: str) -> QIcon:
+    """Icono de la barra de tareas: un circulo del color del estado.
+
+    Se dibuja en memoria (varios tamanos) y se cachea por color.
+    """
+    if state in _icon_cache:
+        return _icon_cache[state]
+    color = COLORS.get(state, COLORS["gray"])
+    icon = QIcon()
+    for size in (16, 24, 32, 48, 64, 256):
+        pm = QPixmap(size, size)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setBrush(color)
+        p.setPen(Qt.NoPen)
+        m = size * 0.12
+        p.drawEllipse(QRectF(m, m, size - 2 * m, size - 2 * m))
+        p.end()
+        icon.addPixmap(pm)
+    _icon_cache[state] = icon
+    return icon
+
+
+def overall_state(states) -> str:
+    """Estado global mas urgente de una lista de estados de sesion."""
+    present = set(states)
+    for s in OVERALL_PRIORITY:
+        if s in present:
+            return s
+    return "gray"
 
 LABELS = {
     "green": "trabajando",
@@ -359,6 +399,22 @@ class MainWindow(QWidget):
                 row.deleteLater()
 
         self.empty.setVisible(not self.rows)
+
+        # Icono de la barra de tareas segun el estado global mas urgente.
+        # active = lista de (order, sid, data, stale, age); el estado ya
+        # tiene en cuenta 'stale' (que lo convierte en gris).
+        states = [
+            ("gray" if stale else data.get("state", "gray"))
+            for (_o, _sid, data, stale, _age) in active
+        ]
+        self.apply_overall_icon(overall_state(states))
+
+    def apply_overall_icon(self, state: str) -> None:
+        """Actualiza el icono de la ventana/barra de tareas si cambio."""
+        if getattr(self, "_current_icon_state", None) == state:
+            return
+        self._current_icon_state = state
+        self.setWindowIcon(state_icon(state))
 
     def bring_to_front(self) -> None:
         """Restaura la ventana (si estaba minimizada) y la trae al frente.
