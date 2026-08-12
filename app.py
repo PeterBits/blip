@@ -43,7 +43,7 @@ def pid_alive(pid: int) -> bool:
     except Exception:
         return True
 
-from PySide6.QtCore import Qt, QTimer, QRectF
+from PySide6.QtCore import Qt, QTimer, QRectF, Signal
 from PySide6.QtGui import QColor, QPainter, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -180,14 +180,61 @@ class LightDot(QWidget):
         p.drawEllipse(0, 0, self._d, self._d)
 
 
+class StarButton(QLabel):
+    """Estrella clicable para marcar una sesion como favorita.
+
+    - Favorita: estrella dorada rellena (siempre visible).
+    - No favorita: estrella vacia y tenue, solo visible al pasar el raton
+      por la fila.
+    """
+
+    clicked = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedWidth(20)
+        self.setAlignment(Qt.AlignCenter)
+        self.setCursor(Qt.PointingHandCursor)
+        self._fav = False
+        self._hover_row = False
+        self.render()
+
+    def set_favorite(self, fav: bool) -> None:
+        self._fav = fav
+        self.render()
+
+    def set_row_hover(self, hovering: bool) -> None:
+        self._hover_row = hovering
+        self.render()
+
+    def render(self) -> None:
+        if self._fav:
+            self.setText("★")  # estrella rellena
+            self.setStyleSheet("color: #f1c40f; font-size: 15px;")
+        elif self._hover_row:
+            self.setText("☆")  # estrella vacia
+            self.setStyleSheet("color: #7f8c8d; font-size: 15px;")
+        else:
+            self.setText("")
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
 class SessionRow(QWidget):
-    """Una fila: luz + (repo / titulo de conversacion) + estado + tiempo."""
+    """Una fila: luz + (repo / titulo de conversacion) + estado + tiempo + estrella."""
+
+    fav_toggled = Signal()
 
     def __init__(self):
         super().__init__()
         self.setObjectName("row")
+        # Seguir el raton para mostrar la estrella al hacer hover.
+        self.setAttribute(Qt.WA_Hover, True)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setContentsMargins(12, 8, 8, 8)
         layout.setSpacing(10)
 
         self.dot = LightDot()
@@ -216,15 +263,29 @@ class SessionRow(QWidget):
         right_box.addWidget(self.status)
         right_box.addWidget(self.age)
 
+        self.star = StarButton()
+        self.star.clicked.connect(self.fav_toggled)
+
         layout.addWidget(self.dot)
         layout.addLayout(text_box, 1)
         layout.addLayout(right_box)
+        layout.addWidget(self.star)
 
-    def update_from(self, data: dict, stale: bool, age_seconds: float) -> None:
+    def enterEvent(self, event) -> None:
+        self.star.set_row_hover(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self.star.set_row_hover(False)
+        super().leaveEvent(event)
+
+    def update_from(self, data: dict, stale: bool, age_seconds: float,
+                    favorite: bool = False) -> None:
         state = data.get("state", "gray")
         if stale:
             state = "gray"
         self.dot.set_color(COLORS.get(state, COLORS["gray"]))
+        self.star.set_favorite(favorite)
 
         self.repo.setText(data.get("project") or data.get("session_id", "?")[:8])
         title = data.get("title", "") or ""
@@ -301,6 +362,10 @@ class MainWindow(QWidget):
         # session_id -> SessionRow
         self.rows: dict[str, SessionRow] = {}
 
+        # session_ids marcados como favoritos (persisten mientras la app
+        # este abierta). Las favoritas van siempre arriba de la lista.
+        self.favorites: set[str] = set()
+
         # Timer de estado: relee los ficheros y actualiza colores/orden.
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -369,9 +434,10 @@ class MainWindow(QWidget):
             order = STATE_ORDER.get(state, 9)
             active.append((order, sid, data, stale, age))
 
-        # Ordenar por urgencia (naranja, rojo, verde, gris) y, dentro de
-        # cada grupo, la que lleva mas tiempo esperando primero.
-        active.sort(key=lambda t: (t[0], -t[4]))
+        # Ordenar: primero las favoritas, y dentro de cada grupo por urgencia
+        # (naranja, rojo, verde, gris) y, a igualdad, la que lleva mas tiempo
+        # esperando primero. 'is not fav' -> False(0) ordena antes que True(1).
+        active.sort(key=lambda t: (t[1] not in self.favorites, t[0], -t[4]))
 
         # Crear/actualizar filas y recolocarlas en el orden calculado.
         for position, (order, sid, data, stale, age) in enumerate(active):
@@ -379,7 +445,9 @@ class MainWindow(QWidget):
             if row is None:
                 row = SessionRow()
                 self.rows[sid] = row
-            row.update_from(data, stale, age)
+                # Al pulsar la estrella, alternar el favorito de ESTA sesion.
+                row.fav_toggled.connect(lambda s=sid: self.toggle_favorite(s))
+            row.update_from(data, stale, age, favorite=sid in self.favorites)
             # Reubicar en la posicion correcta (quitar y reinsertar).
             self.list_layout.removeWidget(row)
             self.list_layout.insertWidget(position, row)
@@ -401,6 +469,14 @@ class MainWindow(QWidget):
             for (_o, _sid, data, stale, _age) in active
         ]
         self.apply_overall_icon(overall_state(states))
+
+    def toggle_favorite(self, session_id: str) -> None:
+        """Marca/desmarca una sesion como favorita y reordena al instante."""
+        if session_id in self.favorites:
+            self.favorites.discard(session_id)
+        else:
+            self.favorites.add(session_id)
+        self.refresh()
 
     def apply_overall_icon(self, state: str) -> None:
         """Actualiza el icono de la ventana/barra de tareas si cambio."""
