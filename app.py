@@ -13,6 +13,7 @@ minimizar.
 """
 
 import sys
+import os
 import json
 from pathlib import Path
 from datetime import datetime, timezone
@@ -43,7 +44,224 @@ def pid_alive(pid: int) -> bool:
     except Exception:
         return True
 
-from PySide6.QtCore import Qt, QTimer, QRectF, Signal
+# Nombres de proceso que suelen ser la ventana de una terminal.
+_TERMINAL_NAMES = {
+    "windowsterminal.exe", "wt.exe", "openconsole.exe", "conhost.exe",
+    "cmd.exe", "powershell.exe", "pwsh.exe", "code.exe", "code - insiders.exe",
+    "alacritty.exe", "wezterm-gui.exe", "conemu.exe", "conemu64.exe",
+    "mintty.exe", "hyper.exe", "tabby.exe",
+}
+
+
+def _related_pids(pid: int) -> set:
+    """PID + ancestros + descendientes: donde puede vivir la ventana host.
+
+    La terminal que lanzo 'claude' suele ser un ancestro (p. ej.
+    WindowsTerminal -> shell -> claude), y a veces el host es un
+    descendiente (conhost). Recogemos ambos para localizar su ventana.
+    """
+    pids = {pid}
+    try:
+        import psutil
+        p = psutil.Process(pid)
+        cur = p
+        for _ in range(20):
+            cur = cur.parent()
+            if cur is None:
+                break
+            pids.add(cur.pid)
+        for ch in p.children(recursive=True):
+            pids.add(ch.pid)
+    except Exception:
+        pass
+    return pids
+
+
+def _pname(pid: int) -> str:
+    try:
+        import psutil
+        return (psutil.Process(pid).name() or "").lower()
+    except Exception:
+        return ""
+
+
+# Glyphs de estado que Claude Code antepone al titulo de la terminal
+# (spinner, marcas de progreso). Se ignoran al comparar titulos.
+_TITLE_JUNK = "◐◑◒◓●○◍◌◉✻✽✶✳✷✦∗*·•–—-‐ \t\r\n"
+
+
+def _norm_title(s: str) -> str:
+    """Normaliza un titulo para comparar: minusculas, sin glyphs de estado
+    al principio ni puntos suspensivos/espacios al final, espacios colapsados.
+    """
+    s = " ".join((s or "").split()).lower()
+    s = s.lstrip(_TITLE_JUNK).rstrip("… .")
+    return s
+
+
+def _title_score(win_title: str, sess_title: str) -> int:
+    """Puntua cuanto encaja el titulo de una ventana con el de la sesion.
+
+    El titulo de la ventana suele venir con un glyph de spinner delante y
+    truncado (WT recorta a ~55 chars), asi que basta con que uno sea prefijo
+    del otro (o contenido en el otro). Devuelve la longitud coincidente, 0
+    si no encaja o el titulo de sesion es muy corto para fiarse.
+    """
+    w = _norm_title(win_title)
+    t = _norm_title(sess_title)
+    if len(t) < 6 or len(w) < 6:
+        return 0
+    if t.startswith(w) or w.startswith(t) or t in w or w in t:
+        return min(len(w), len(t))
+    return 0
+
+
+def focus_terminal(pid: int, title: str = "", repo: str = "") -> bool:
+    """Trae al frente la ventana de la terminal de una sesion de Claude Code.
+
+    Universal por terminal, prueba en orden:
+      1) Por TITULO: la ventana cuyo titulo coincide con el de la
+         conversacion. Es lo que hace Windows Terminal (una ventana/pestana
+         por sesion, titulada con la conversacion) y lo mas preciso.
+      2) Consola clasica (conhost): AttachConsole(pid) + GetConsoleWindow.
+      3) Por proceso: ventana de un proceso emparentado que parece terminal.
+      4) Ultimo recurso: una unica ventana de Windows Terminal visible.
+
+    Devuelve True si logro enfocar algo.
+    """
+    if not pid or sys.platform != "win32":
+        return False
+    try:
+        return _focus_terminal_win(int(pid), title or "", repo or "")
+    except Exception:
+        return False
+
+
+def _focus_terminal_win(pid: int, title: str, repo: str) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.windll.kernel32
+    u32 = ctypes.windll.user32
+    k32.AttachConsole.argtypes = [wintypes.DWORD]
+    k32.GetConsoleWindow.restype = wintypes.HWND
+    k32.GetCurrentThreadId.restype = wintypes.DWORD
+    u32.IsWindow.argtypes = [wintypes.HWND]
+    u32.IsWindowVisible.argtypes = [wintypes.HWND]
+    u32.IsIconic.argtypes = [wintypes.HWND]
+    u32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    u32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    u32.SetActiveWindow.argtypes = [wintypes.HWND]
+    u32.BringWindowToTop.argtypes = [wintypes.HWND]
+    u32.AttachThreadInput.argtypes = [
+        wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    u32.GetForegroundWindow.restype = wintypes.HWND
+    u32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    u32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    u32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    u32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+
+    SW_RESTORE, SW_SHOW = 9, 5
+
+    def focus(hwnd) -> bool:
+        """Trae hwnd al frente de forma fiable (salto entre procesos).
+
+        SetForegroundWindow solo no basta cuando el objetivo es de otro
+        proceso: hay que 'engancharse' al hilo de la ventana en primer plano
+        y a la del objetivo con AttachThreadInput para saltarnos el bloqueo
+        de foco de Windows.
+        """
+        if not hwnd or not u32.IsWindow(hwnd):
+            return False
+        if u32.IsIconic(hwnd):
+            u32.ShowWindow(hwnd, SW_RESTORE)
+        fg = u32.GetForegroundWindow()
+        t_me = k32.GetCurrentThreadId()
+        t_tg = u32.GetWindowThreadProcessId(hwnd, None)
+        t_fg = u32.GetWindowThreadProcessId(fg, None) if fg else 0
+        if t_fg and t_fg != t_me:
+            u32.AttachThreadInput(t_me, t_fg, True)
+        if t_tg and t_tg != t_me:
+            u32.AttachThreadInput(t_me, t_tg, True)
+        u32.BringWindowToTop(hwnd)
+        u32.ShowWindow(hwnd, SW_SHOW)
+        u32.SetForegroundWindow(hwnd)
+        u32.SetActiveWindow(hwnd)
+        if t_tg and t_tg != t_me:
+            u32.AttachThreadInput(t_me, t_tg, False)
+        if t_fg and t_fg != t_me:
+            u32.AttachThreadInput(t_me, t_fg, False)
+        return True
+
+    # Enumerar ventanas visibles con titulo (hwnd, pid, nombre_proc, titulo).
+    windows = []
+    WNDENUMPROC = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def collect(hwnd, _lparam):
+        if u32.IsWindowVisible(hwnd):
+            n = u32.GetWindowTextLengthW(hwnd)
+            if n > 0:
+                wpid = wintypes.DWORD()
+                u32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+                buf = ctypes.create_unicode_buffer(n + 1)
+                u32.GetWindowTextW(hwnd, buf, n + 1)
+                windows.append((hwnd, wpid.value, _pname(wpid.value),
+                                buf.value))
+        return True
+
+    u32.EnumWindows(WNDENUMPROC(collect), 0)
+    own = os.getpid()
+
+    # --- 1) Por titulo de conversacion (lo mas preciso; ideal para WT) ---
+    if title:
+        best = None
+        best_score = 0
+        for hwnd, wpid, name, wtitle in windows:
+            if wpid == own or name not in _TERMINAL_NAMES:
+                continue
+            score = _title_score(wtitle, title)
+            if score > best_score:
+                best_score, best = score, hwnd
+        if best is not None:
+            return focus(best)
+
+    # --- 2) Consola clasica via AttachConsole ----------------------------
+    k32.FreeConsole()  # soltar nuestra consola (si la hay) antes de unirnos
+    console_hwnd = 0
+    if k32.AttachConsole(pid):
+        try:
+            console_hwnd = k32.GetConsoleWindow()
+        finally:
+            k32.FreeConsole()
+    if console_hwnd and u32.IsWindowVisible(console_hwnd):
+        return focus(console_hwnd)
+
+    # --- 3) Por proceso emparentado --------------------------------------
+    related = _related_pids(pid)
+    strong = weak = None
+    for hwnd, wpid, name, _wtitle in windows:
+        if wpid == own:
+            continue
+        if wpid in related and name in _TERMINAL_NAMES:
+            strong = hwnd
+            break
+        if weak is None and wpid in related and name != "explorer.exe":
+            weak = hwnd
+    target = strong or weak
+
+    # --- 4) Ultimo recurso: una unica ventana de Windows Terminal --------
+    if target is None:
+        terms = [h for (h, _p, name, _t) in windows
+                 if name in ("windowsterminal.exe", "wt.exe")]
+        if len(terms) == 1:
+            target = terms[0]
+
+    return focus(target) if target else False
+
+
+from PySide6.QtCore import Qt, QTimer, QRectF, Signal, QEvent
 from PySide6.QtGui import QColor, QPainter, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -53,6 +271,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QScrollArea,
     QFrame,
+    QPushButton,
 )
 
 
@@ -73,6 +292,29 @@ def app_icon() -> QIcon:
     return QIcon(str(ico)) if ico.exists() else QIcon()
 
 STATE_DIR = Path.home() / ".claude" / "blip"
+
+# Preferencias persistentes de la app (p. ej. si el modo Split esta activo).
+# Sibling de STATE_DIR a proposito: dentro de STATE_DIR se leeria como una
+# "sesion" mas (refresh() hace glob de *.json en esa carpeta).
+SETTINGS_FILE = Path.home() / ".claude" / "blip.settings.json"
+
+
+def load_settings() -> dict:
+    """Lee las preferencias guardadas; {} si no hay o esta corrupto."""
+    try:
+        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_settings(data: dict) -> None:
+    """Guarda las preferencias (silencioso si no se puede escribir)."""
+    try:
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_FILE.write_text(json.dumps(data), encoding="utf-8")
+    except OSError:
+        pass
+
 
 # Si una sesion no se actualiza en este tiempo, se considera obsoleta.
 STALE_SECONDS = 60 * 30  # 30 min
@@ -368,6 +610,115 @@ class SessionRow(QWidget):
         self._render_age()
 
 
+class PilotWindow(QWidget):
+    """Piloto por sesion en la barra de tareas (modo Split).
+
+    - Boton de la barra de tareas: el icono es el circulo del color del
+      estado (la 'lucecita').
+    - Preview al pasar el raton: el TITULO de la ventana (repo + estado +
+      tiempo) aparece como cabecera de texto, y la miniatura muestra una
+      tarjeta oscura con repo, titulo de la conversacion, estado y tiempo.
+
+    Al clicar su boton en la barra de tareas Windows lo restaura y emite
+    'clicked', que Blip usa para saltar a la terminal de esa sesion.
+    """
+
+    clicked = Signal()
+
+    def __init__(self, info: dict):
+        super().__init__()
+        self._closing = False
+        self._state = None
+        self._caption = None
+        self.pid = info.get("pid", 0)
+        self.setWindowIcon(state_icon(info.get("state", "gray")))
+        # Tarjeta pequena; su contenido es lo que se ve en la miniatura.
+        self.setFixedSize(240, 74)
+        self.setStyleSheet("background: #232f38; border-radius: 8px;")
+
+        box = QVBoxLayout(self)
+        box.setContentsMargins(14, 10, 14, 10)
+        box.setSpacing(2)
+
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        top.setContentsMargins(0, 0, 0, 0)
+        self.dot = LightDot(12)
+        self.repo = QLabel("-")
+        self.repo.setStyleSheet(
+            "color: #ecf0f1; font-size: 13px; font-weight: 600;")
+        top.addWidget(self.dot)
+        top.addWidget(self.repo, 1)
+
+        self.title = QLabel("")
+        self.title.setStyleSheet("color: #9aa5ad; font-size: 11px;")
+        self.status = QLabel("-")
+        self.status.setStyleSheet("color: #95a5a6; font-size: 11px;")
+
+        box.addLayout(top)
+        box.addWidget(self.title)
+        box.addWidget(self.status)
+
+        self.apply(info)
+
+        # Pintar una vez FUERA de pantalla y minimizar: asi la miniatura de
+        # la barra de tareas muestra la tarjeta (no un cuadro en blanco) y no
+        # hay parpadeo al clicar (la ventanita vive fuera de la vista).
+        self.move(-20000, -20000)
+        self.show()
+        self.showMinimized()
+
+    def apply(self, info: dict) -> None:
+        """Refresca contenido/estado/pid del piloto sin recrearlo."""
+        self.pid = info.get("pid", 0) or self.pid
+        state = info.get("state", "gray")
+        repo = info.get("repo", "-")
+        conv = info.get("title") or ""
+        age = info.get("age", 0.0)
+        # Guardados para saltar a la terminal correcta al clicar.
+        self.conv_title = conv
+        self.repo_name = repo
+        label = LABELS.get(state, state)
+        waiting = state in ("yellow", "red")
+        color = COLORS.get(state, COLORS["gray"]).name()
+
+        self.repo.setText(repo)
+        self.dot.set_color(COLORS.get(state, COLORS["gray"]))
+        self.title.setText(conv)
+        self.title.setVisible(bool(conv))
+        self.status.setText(f"{label}  ·  {human_age(age)}" if waiting else label)
+        self.status.setStyleSheet(
+            f"color: {color}; font-size: 11px; font-weight: 600;")
+
+        if state != self._state:
+            self._state = state
+            self.setWindowIcon(state_icon(state))
+
+        # Cabecera de texto del preview (titulo de la ventana).
+        caption = repo
+        if conv:
+            caption += f" — {conv}"
+        caption += f"  ·  {label}"
+        if waiting:
+            caption += f"  ·  {human_age(age)}"
+        if caption != self._caption:
+            self._caption = caption
+            self.setWindowTitle(caption)
+
+    def close_silently(self) -> None:
+        """Cierra el piloto sin que dispare 'clicked'."""
+        self._closing = True
+        self.close()
+
+    def changeEvent(self, event) -> None:
+        # Al quitarse el estado 'minimizado' (el usuario clico su boton en la
+        # barra de tareas) avisamos para saltar a la terminal de la sesion.
+        if event.type() == QEvent.WindowStateChange:
+            if not self._closing and not (self.windowState() & Qt.WindowMinimized):
+                self.clicked.emit()
+        super().changeEvent(event)
+
+
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -378,9 +729,32 @@ class MainWindow(QWidget):
         self.resize(340, 400)
         self.setStyleSheet("background: #1e272e;")
 
+        # Modo Split (persistente): al minimizar, una lucecita por sesion en
+        # la barra de tareas en vez de un unico icono.
+        self.split_enabled = bool(load_settings().get("split", False))
+        # Pilotos vivos (session_id -> PilotWindow) y si estamos en esa vista.
+        self.pilots: dict[str, PilotWindow] = {}
+        self._in_split_view = False
+        # Ultima instantanea de sesiones (dicts) para los pilotos.
+        self._session_snapshot: list[dict] = []
+
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+
+        # Cabecera con el boton Split alineado a la derecha.
+        header = QHBoxLayout()
+        header.setContentsMargins(10, 8, 8, 4)
+        header.setSpacing(6)
+        header.addStretch()
+        self.split_btn = QPushButton("Split")
+        self.split_btn.setCheckable(True)
+        self.split_btn.setCursor(Qt.PointingHandCursor)
+        self.split_btn.setChecked(self.split_enabled)
+        self.split_btn.clicked.connect(self.toggle_split)
+        self._style_split_btn()
+        header.addWidget(self.split_btn)
+        root.addLayout(header)
 
         self.empty = QLabel("  Sin sesiones activas")
         self.empty.setStyleSheet("color: #636e72; font-size: 12px; padding: 16px;")
@@ -532,6 +906,22 @@ class MainWindow(QWidget):
         ]
         self.apply_overall_icon(overall_state(states))
 
+        # Instantanea para los pilotos del modo Split. Si estamos en esa
+        # vista (ventana minimizada), sincronizarlos con las sesiones actuales.
+        self._session_snapshot = [
+            {
+                "sid": sid,
+                "repo": data.get("project") or sid[:8],
+                "title": data.get("title") or "",
+                "state": ("gray" if stale else data.get("state", "gray")),
+                "pid": data.get("pid", 0),
+                "age": age,
+            }
+            for (_o, sid, data, stale, age) in active
+        ]
+        if self._in_split_view:
+            self._sync_pilots()
+
     def toggle_favorite(self, session_id: str) -> None:
         """Marca/desmarca una sesion como favorita y reordena al instante."""
         if session_id in self.favorites:
@@ -539,6 +929,101 @@ class MainWindow(QWidget):
         else:
             self.favorites.add(session_id)
         self.refresh()
+
+    # ---- Modo Split ----------------------------------------------------
+
+    def _style_split_btn(self) -> None:
+        """Estilo del boton segun este activo (verde) o no (apagado)."""
+        if self.split_enabled:
+            css = (
+                "QPushButton { color: #1e272e; background: #2ecc71; border: none;"
+                " border-radius: 6px; padding: 4px 12px; font-size: 12px;"
+                " font-weight: 600; }"
+                "QPushButton:hover { background: #43d67f; }"
+            )
+            tip = ("Split activo: al minimizar veras una lucecita por sesion "
+                   "en la barra de tareas.")
+        else:
+            css = (
+                "QPushButton { color: #9aa5ad; background: #2c3a45; border: none;"
+                " border-radius: 6px; padding: 4px 12px; font-size: 12px;"
+                " font-weight: 600; }"
+                "QPushButton:hover { background: #35454f; color: #ecf0f1; }"
+            )
+            tip = ("Split: al minimizar, muestra una lucecita por sesion "
+                   "en la barra de tareas.")
+        self.split_btn.setStyleSheet(css)
+        self.split_btn.setToolTip(tip)
+
+    def toggle_split(self) -> None:
+        """Activa/desactiva el modo Split y lo guarda."""
+        self.split_enabled = self.split_btn.isChecked()
+        save_settings({"split": self.split_enabled})
+        self._style_split_btn()
+        # Si se apaga mientras estabamos en la vista de pilotos, retirarlos.
+        if not self.split_enabled and self._in_split_view:
+            self._exit_split_view()
+
+    def changeEvent(self, event) -> None:
+        # Con Split activo: al minimizar desplegamos los pilotos; al restaurar
+        # la ventana principal los retiramos. Diferido con singleShot para no
+        # manipular ventanas dentro del propio evento de cambio de estado.
+        if event.type() == QEvent.WindowStateChange:
+            minimized = bool(self.windowState() & Qt.WindowMinimized)
+            if minimized and self.split_enabled and not self._in_split_view:
+                QTimer.singleShot(0, self._enter_split_view)
+            elif not minimized and self._in_split_view:
+                self._exit_split_view()
+        super().changeEvent(event)
+
+    def _enter_split_view(self) -> None:
+        """Despliega un piloto (punto) por sesion en la barra de tareas.
+
+        No ocultamos la ventana principal: su boton minimizado sigue en la
+        barra y sirve para volver a la vista completa. Los puntos se suman.
+        """
+        if self._in_split_view or not self.split_enabled:
+            return
+        self._in_split_view = True
+        self._sync_pilots()
+
+    def _sync_pilots(self) -> None:
+        """Crea/actualiza/elimina pilotos para que coincidan con las sesiones."""
+        snapshot = self._session_snapshot
+        ids = {info["sid"] for info in snapshot}
+
+        for sid in list(self.pilots):
+            if sid not in ids:
+                self.pilots.pop(sid).close_silently()
+
+        for info in snapshot:
+            pilot = self.pilots.get(info["sid"])
+            if pilot is None:
+                pilot = PilotWindow(info)
+                pilot.clicked.connect(lambda p=pilot: self._on_pilot_clicked(p))
+                self.pilots[info["sid"]] = pilot
+            else:
+                pilot.apply(info)
+
+    def _on_pilot_clicked(self, pilot: "PilotWindow") -> None:
+        """Clic en un punto: salta a la terminal de esa sesion y deja el
+        punto de nuevo minimizado en la barra de tareas."""
+        focus_terminal(pilot.pid, getattr(pilot, "conv_title", ""),
+                       getattr(pilot, "repo_name", ""))
+        # Windows acaba de restaurar la ventanita (fuera de pantalla);
+        # devolverla a la barra de tareas.
+        QTimer.singleShot(
+            0, lambda: pilot.showMinimized() if not pilot._closing else None)
+
+    def _exit_split_view(self) -> None:
+        """Retira todos los pilotos (vuelta a la vista normal)."""
+        self._in_split_view = False
+        self._destroy_pilots()
+
+    def _destroy_pilots(self) -> None:
+        for pilot in self.pilots.values():
+            pilot.close_silently()
+        self.pilots.clear()
 
     def apply_overall_icon(self, state: str) -> None:
         """Actualiza el icono de la ventana/barra de tareas si cambio."""
@@ -553,6 +1038,9 @@ class MainWindow(QWidget):
         Se invoca cuando una segunda instancia intenta abrirse: en vez de
         crear otra ventana, reactivamos esta.
         """
+        # Si estabamos en la vista de pilotos, cerrarlos antes de restaurar.
+        self._in_split_view = False
+        self._destroy_pilots()
         # Quitar el flag de minimizada conservando los demas estados.
         self.setWindowState(
             (self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive
