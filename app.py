@@ -52,6 +52,9 @@ _TERMINAL_NAMES = {
     "mintty.exe", "hyper.exe", "tabby.exe",
 }
 
+# Windows Terminal: un solo proceso para TODAS sus ventanas y pestanas.
+_WT_NAMES = {"windowsterminal.exe", "wt.exe"}
+
 
 def _related_pids(pid: int) -> set:
     """PID + ancestros + descendientes: donde puede vivir la ventana host.
@@ -116,16 +119,184 @@ def _title_score(win_title: str, sess_title: str) -> int:
     return 0
 
 
+# --- Windows Terminal: seleccion de pestana via UI Automation (opcional) ---
+# En Windows Terminal varias pestanas comparten una ventana y su titulo solo
+# refleja la pestana ACTIVA; enfocar la ventana no basta para llegar a una
+# pestana en segundo plano. Con UI Automation (comtypes) seleccionamos la
+# pestana correcta. Si comtypes/UIA no esta disponible (p. ej. en el .exe
+# empaquetado), se omite y solo se enfoca la ventana (comportamiento previo).
+
+# Titulo que Claude Code fija en la pestana antes de que la conversacion tenga
+# titulo propio: sirve para localizar una sesion aun sin titulo.
+_CLAUDE_DEFAULT_TAB = "claude code"
+
+# Cache perezosa del objeto de UI Automation (COM).
+_uia_cache: dict = {"tried": False, "uia": None, "mod": None}
+
+
+def _get_uia():
+    """Devuelve (automation, modulo) de UI Automation, o (None, None)."""
+    if _uia_cache["tried"]:
+        return _uia_cache["uia"], _uia_cache["mod"]
+    _uia_cache["tried"] = True
+    if sys.platform == "win32":
+        try:
+            import comtypes.client
+            mod = comtypes.client.GetModule("UIAutomationCore.dll")
+            _uia_cache["uia"] = comtypes.client.CreateObject(
+                mod.CUIAutomation, interface=mod.IUIAutomation)
+            _uia_cache["mod"] = mod
+        except Exception:
+            pass
+    return _uia_cache["uia"], _uia_cache["mod"]
+
+
+def _tab_selected(elem) -> bool:
+    """True si esa pestana es la activa de su ventana."""
+    _uia, mod = _get_uia()
+    try:
+        pat = elem.GetCurrentPattern(mod.UIA_SelectionItemPatternId)
+        return bool(pat.QueryInterface(
+            mod.IUIAutomationSelectionItemPattern).CurrentIsSelected)
+    except Exception:
+        return False
+
+
+def _wt_tabs(hwnd) -> list:
+    """Pestanas de una ventana de Windows Terminal: [(nombre, elem, activa)].
+
+    Lista vacia si no hay UIA o la ventana no tiene pestanas (consola
+    clasica y otras terminales).
+    """
+    uia, mod = _get_uia()
+    if uia is None or not hwnd:
+        return []
+    try:
+        el = uia.ElementFromHandle(hwnd)
+        cond = uia.CreatePropertyCondition(
+            mod.UIA_ControlTypePropertyId, mod.UIA_TabItemControlTypeId)
+        found = el.FindAll(mod.TreeScope_Descendants, cond)
+        elems = [found.GetElement(i) for i in range(found.Length)]
+    except Exception:
+        return []
+    tabs = []
+    for elem in elems:
+        try:
+            name = elem.CurrentName or ""
+        except Exception:
+            continue
+        tabs.append((name, elem, _tab_selected(elem)))
+    return tabs
+
+
+def _wt_active_text(hwnd, limit: int = 600) -> str:
+    """Texto del panel ACTIVO de una ventana de Windows Terminal.
+
+    UIA solo expone el panel de la pestana activa. Sirve para reconocer de
+    que proyecto es una sesion que aun no tiene titulo: su pantalla de
+    bienvenida muestra la carpeta de trabajo.
+    """
+    uia, mod = _get_uia()
+    if uia is None:
+        return ""
+    try:
+        el = uia.ElementFromHandle(hwnd)
+        cond = uia.CreatePropertyCondition(
+            mod.UIA_IsTextPatternAvailablePropertyId, True)
+        found = el.FindAll(mod.TreeScope_Descendants, cond)
+        for i in range(found.Length):
+            e = found.GetElement(i)
+            if (e.CurrentClassName or "") != "TermControl":
+                continue
+            pat = e.GetCurrentPattern(mod.UIA_TextPatternId).QueryInterface(
+                mod.IUIAutomationTextPattern)
+            return pat.DocumentRange.GetText(limit) or ""
+    except Exception:
+        pass
+    return ""
+
+
+def _pick_wt_tab(hwnds: list, title: str, repo: str):
+    """Localiza la pestana de una sesion entre TODAS las ventanas de WT.
+
+    Devuelve (hwnd, elem_pestana) o None. El orden de pistas es:
+      1) El titulo de la conversacion contra el nombre de cada pestana de
+         cada ventana (tambien las que estan en segundo plano, que no
+         aparecen en el titulo de la ventana).
+      2) Sin titulo aun, la pestana se llama "Claude Code": si hay una
+         sola en todo el escritorio es esa. Si hay varias, se desempata
+         con el panel activo de cada ventana (lo unico que UIA deja leer),
+         que muestra la carpeta de trabajo: vale para reconocer la nuestra
+         o para descartar las que son de otra sesion.
+
+    Si no se puede identificar con seguridad devuelve None: es mejor no
+    hacer nada que cambiar de pestana en una sesion ajena.
+    """
+    cands = [(hwnd, name, elem, sel)
+             for hwnd in hwnds for (name, elem, sel) in _wt_tabs(hwnd)]
+    if not cands:
+        return None
+
+    if _norm_title(title):
+        best, best_score = None, 0
+        for hwnd, name, elem, _sel in cands:
+            score = _title_score(name, title)
+            if score > best_score:
+                best_score, best = score, (hwnd, elem)
+        if best is not None:
+            return best
+
+    defaults = [(hwnd, elem, sel) for hwnd, name, elem, sel in cands
+                if _norm_title(name) == _CLAUDE_DEFAULT_TAB]
+    if len(defaults) == 1:
+        hwnd, elem, _sel = defaults[0]
+        return hwnd, elem
+    if len(defaults) > 1 and repo:
+        needle = repo.lower()
+        texts: dict = {}
+
+        def active_text(hwnd) -> str:
+            if hwnd not in texts:
+                texts[hwnd] = _wt_active_text(hwnd).lower()
+            return texts[hwnd]
+
+        hits = [(hwnd, elem) for hwnd, elem, sel in defaults
+                if sel and needle in active_text(hwnd)]
+        if len(hits) == 1:
+            return hits[0]
+        # Descarte: una pestana activa que no habla de nuestro proyecto es
+        # de otra sesion. Si al quitarlas queda una sola, esa es la nuestra
+        # (tipico de una sesion recien abierta en una pestana de fondo, cuyo
+        # panel no se puede leer).
+        rest = [(hwnd, elem) for hwnd, elem, sel in defaults
+                if not sel or needle in active_text(hwnd)]
+        if len(rest) == 1:
+            return rest[0]
+    return None
+
+
+def _select_tab(elem) -> bool:
+    """Activa una pestana (la trae al frente dentro de su ventana)."""
+    _uia, mod = _get_uia()
+    try:
+        pat = elem.GetCurrentPattern(mod.UIA_SelectionItemPatternId)
+        pat.QueryInterface(mod.IUIAutomationSelectionItemPattern).Select()
+        return True
+    except Exception:
+        return False
+
+
 def focus_terminal(pid: int, title: str = "", repo: str = "") -> bool:
     """Trae al frente la ventana de la terminal de una sesion de Claude Code.
 
     Universal por terminal, prueba en orden:
-      1) Por TITULO: la ventana cuyo titulo coincide con el de la
-         conversacion. Es lo que hace Windows Terminal (una ventana/pestana
-         por sesion, titulada con la conversacion) y lo mas preciso.
-      2) Consola clasica (conhost): AttachConsole(pid) + GetConsoleWindow.
-      3) Por proceso: ventana de un proceso emparentado que parece terminal.
-      4) Ultimo recurso: una unica ventana de Windows Terminal visible.
+      1) Windows Terminal: la PESTANA exacta de la sesion (via UIA), en
+         cualquiera de sus ventanas, incluso si esta en segundo plano.
+      2) Por TITULO de ventana (sin UIA disponible): la ventana cuyo
+         titulo coincide con el de la conversacion.
+      3) Consola clasica (conhost): AttachConsole(pid) + GetConsoleWindow.
+      4) Por proceso: ventana de un proceso emparentado que parece terminal.
+      5) Ultimo recurso: una unica ventana de Windows Terminal visible.
 
     Devuelve True si logro enfocar algo.
     """
@@ -214,7 +385,18 @@ def _focus_terminal_win(pid: int, title: str, repo: str) -> bool:
     u32.EnumWindows(WNDENUMPROC(collect), 0)
     own = os.getpid()
 
-    # --- 1) Por titulo de conversacion (lo mas preciso; ideal para WT) ---
+    wt_hwnds = [h for (h, _p, name, _t) in windows if name in _WT_NAMES]
+
+    # --- 1) Windows Terminal: la pestana exacta de la sesion (UIA) -------
+    picked = _pick_wt_tab(wt_hwnds, title, repo)
+    if picked is not None:
+        hwnd, tab = picked
+        if u32.IsIconic(hwnd):
+            u32.ShowWindow(hwnd, SW_RESTORE)
+        _select_tab(tab)
+        return focus(hwnd)
+
+    # --- 2) Por titulo de ventana (sin UIA solo alcanza pestanas activas)
     if title:
         best = None
         best_score = 0
@@ -227,7 +409,7 @@ def _focus_terminal_win(pid: int, title: str, repo: str) -> bool:
         if best is not None:
             return focus(best)
 
-    # --- 2) Consola clasica via AttachConsole ----------------------------
+    # --- 3) Consola clasica via AttachConsole ----------------------------
     k32.FreeConsole()  # soltar nuestra consola (si la hay) antes de unirnos
     console_hwnd = 0
     if k32.AttachConsole(pid):
@@ -238,11 +420,15 @@ def _focus_terminal_win(pid: int, title: str, repo: str) -> bool:
     if console_hwnd and u32.IsWindowVisible(console_hwnd):
         return focus(console_hwnd)
 
-    # --- 3) Por proceso emparentado --------------------------------------
+    # --- 4) Por proceso emparentado --------------------------------------
+    # Ojo: todas las ventanas de Windows Terminal comparten un mismo
+    # proceso, asi que si hay varias el PID no dice cual es la de esta
+    # sesion; se dejan fuera para no saltar a una ventana ajena.
     related = _related_pids(pid)
+    ambiguous_wt = len(wt_hwnds) > 1
     strong = weak = None
     for hwnd, wpid, name, _wtitle in windows:
-        if wpid == own:
+        if wpid == own or (ambiguous_wt and name in _WT_NAMES):
             continue
         if wpid in related and name in _TERMINAL_NAMES:
             strong = hwnd
@@ -251,17 +437,16 @@ def _focus_terminal_win(pid: int, title: str, repo: str) -> bool:
             weak = hwnd
     target = strong or weak
 
-    # --- 4) Ultimo recurso: una unica ventana de Windows Terminal --------
-    if target is None:
-        terms = [h for (h, _p, name, _t) in windows
-                 if name in ("windowsterminal.exe", "wt.exe")]
-        if len(terms) == 1:
-            target = terms[0]
+    # --- 5) Ultimo recurso: una unica ventana de Windows Terminal --------
+    if target is None and len(wt_hwnds) == 1:
+        target = wt_hwnds[0]
 
-    return focus(target) if target else False
+    if target:
+        return focus(target)
+    return False
 
 
-from PySide6.QtCore import Qt, QTimer, QRectF, Signal, QEvent
+from PySide6.QtCore import Qt, QTimer, QRectF, Signal
 from PySide6.QtGui import QColor, QPainter, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -271,7 +456,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QScrollArea,
     QFrame,
-    QPushButton,
 )
 
 
@@ -292,29 +476,6 @@ def app_icon() -> QIcon:
     return QIcon(str(ico)) if ico.exists() else QIcon()
 
 STATE_DIR = Path.home() / ".claude" / "blip"
-
-# Preferencias persistentes de la app (p. ej. si el modo Split esta activo).
-# Sibling de STATE_DIR a proposito: dentro de STATE_DIR se leeria como una
-# "sesion" mas (refresh() hace glob de *.json en esa carpeta).
-SETTINGS_FILE = Path.home() / ".claude" / "blip.settings.json"
-
-
-def load_settings() -> dict:
-    """Lee las preferencias guardadas; {} si no hay o esta corrupto."""
-    try:
-        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def save_settings(data: dict) -> None:
-    """Guarda las preferencias (silencioso si no se puede escribir)."""
-    try:
-        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SETTINGS_FILE.write_text(json.dumps(data), encoding="utf-8")
-    except OSError:
-        pass
-
 
 # Si una sesion no se actualiza en este tiempo, se considera obsoleta.
 STALE_SECONDS = 60 * 30  # 30 min
@@ -464,6 +625,10 @@ class StarButton(QLabel):
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
             self.clicked.emit()
+            # Consumir el evento: no debe propagarse a la fila (que abriria la
+            # terminal). La estrella solo alterna la favorita.
+            event.accept()
+            return
         super().mousePressEvent(event)
 
 
@@ -489,14 +654,28 @@ class SessionRow(QWidget):
     """Una fila: luz + (repo / titulo de conversacion) + estado + tiempo + estrella."""
 
     fav_toggled = Signal()
+    activated = Signal()  # clic simple: ir a la terminal de esta sesion
 
     def __init__(self):
         super().__init__()
         self.setObjectName("row")
         # Seguir el raton para mostrar la estrella al hacer hover.
         self.setAttribute(Qt.WA_Hover, True)
-        # Toda la fila es clicable (doble clic = favorita) -> cursor de mano.
+        # Toda la fila es clicable (clic = terminal, doble clic = favorita).
         self.setCursor(Qt.PointingHandCursor)
+
+        # Datos de la sesion para localizar su terminal al hacer clic.
+        self._pid = 0
+        self._title = ""
+        self._repo = ""
+        # Distinguir clic simple de doble: al soltar arrancamos un temporizador
+        # con el intervalo de doble clic del sistema; si llega un doble clic lo
+        # cancelamos. Si expira, fue un clic simple de verdad -> abrir terminal.
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.timeout.connect(self.activated)
+        self._suppress_next_release = False
+
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 8, 8, 8)
         layout.setSpacing(10)
@@ -555,9 +734,23 @@ class SessionRow(QWidget):
         self.star.set_row_hover(False)
         super().leaveEvent(event)
 
+    def mouseReleaseEvent(self, event) -> None:
+        # Candidato a clic simple: esperar el intervalo de doble clic antes de
+        # dar la accion por buena, por si es la primera mitad de un doble clic.
+        if event.button() == Qt.LeftButton:
+            if self._suppress_next_release:
+                # Este release es la segunda mitad de un doble clic ya tratado.
+                self._suppress_next_release = False
+            else:
+                self._click_timer.start(QApplication.doubleClickInterval())
+        super().mouseReleaseEvent(event)
+
     def mouseDoubleClickEvent(self, event) -> None:
         # Doble clic en cualquier parte de la fila -> marcar/desmarcar favorita.
         if event.button() == Qt.LeftButton:
+            # Cancelar el clic simple pendiente y no abrir la terminal.
+            self._click_timer.stop()
+            self._suppress_next_release = True
             self.fav_toggled.emit()
         super().mouseDoubleClickEvent(event)
 
@@ -566,11 +759,20 @@ class SessionRow(QWidget):
         state = data.get("state", "gray")
         if stale:
             state = "gray"
+        try:
+            self._pid = int(data.get("pid") or 0)
+        except (TypeError, ValueError):
+            self._pid = 0
         self.dot.set_color(COLORS.get(state, COLORS["gray"]))
         self.star.set_favorite(favorite)
 
-        self.repo.setText(data.get("project") or data.get("session_id", "?")[:8])
+        repo = data.get("project") or data.get("session_id", "?")[:8]
+        self.repo.setText(repo)
         title = data.get("title", "") or ""
+        # Pistas para localizar la terminal al hacer clic (la terminal titula
+        # la pestana/ventana con el titulo de la conversacion).
+        self._repo = repo
+        self._title = title
         self.title.setText(title)
         self.title.setVisible(bool(title))
 
@@ -610,115 +812,6 @@ class SessionRow(QWidget):
         self._render_age()
 
 
-class PilotWindow(QWidget):
-    """Piloto por sesion en la barra de tareas (modo Split).
-
-    - Boton de la barra de tareas: el icono es el circulo del color del
-      estado (la 'lucecita').
-    - Preview al pasar el raton: el TITULO de la ventana (repo + estado +
-      tiempo) aparece como cabecera de texto, y la miniatura muestra una
-      tarjeta oscura con repo, titulo de la conversacion, estado y tiempo.
-
-    Al clicar su boton en la barra de tareas Windows lo restaura y emite
-    'clicked', que Blip usa para saltar a la terminal de esa sesion.
-    """
-
-    clicked = Signal()
-
-    def __init__(self, info: dict):
-        super().__init__()
-        self._closing = False
-        self._state = None
-        self._caption = None
-        self.pid = info.get("pid", 0)
-        self.setWindowIcon(state_icon(info.get("state", "gray")))
-        # Tarjeta pequena; su contenido es lo que se ve en la miniatura.
-        self.setFixedSize(240, 74)
-        self.setStyleSheet("background: #232f38; border-radius: 8px;")
-
-        box = QVBoxLayout(self)
-        box.setContentsMargins(14, 10, 14, 10)
-        box.setSpacing(2)
-
-        top = QHBoxLayout()
-        top.setSpacing(8)
-        top.setContentsMargins(0, 0, 0, 0)
-        self.dot = LightDot(12)
-        self.repo = QLabel("-")
-        self.repo.setStyleSheet(
-            "color: #ecf0f1; font-size: 13px; font-weight: 600;")
-        top.addWidget(self.dot)
-        top.addWidget(self.repo, 1)
-
-        self.title = QLabel("")
-        self.title.setStyleSheet("color: #9aa5ad; font-size: 11px;")
-        self.status = QLabel("-")
-        self.status.setStyleSheet("color: #95a5a6; font-size: 11px;")
-
-        box.addLayout(top)
-        box.addWidget(self.title)
-        box.addWidget(self.status)
-
-        self.apply(info)
-
-        # Pintar una vez FUERA de pantalla y minimizar: asi la miniatura de
-        # la barra de tareas muestra la tarjeta (no un cuadro en blanco) y no
-        # hay parpadeo al clicar (la ventanita vive fuera de la vista).
-        self.move(-20000, -20000)
-        self.show()
-        self.showMinimized()
-
-    def apply(self, info: dict) -> None:
-        """Refresca contenido/estado/pid del piloto sin recrearlo."""
-        self.pid = info.get("pid", 0) or self.pid
-        state = info.get("state", "gray")
-        repo = info.get("repo", "-")
-        conv = info.get("title") or ""
-        age = info.get("age", 0.0)
-        # Guardados para saltar a la terminal correcta al clicar.
-        self.conv_title = conv
-        self.repo_name = repo
-        label = LABELS.get(state, state)
-        waiting = state in ("yellow", "red")
-        color = COLORS.get(state, COLORS["gray"]).name()
-
-        self.repo.setText(repo)
-        self.dot.set_color(COLORS.get(state, COLORS["gray"]))
-        self.title.setText(conv)
-        self.title.setVisible(bool(conv))
-        self.status.setText(f"{label}  ·  {human_age(age)}" if waiting else label)
-        self.status.setStyleSheet(
-            f"color: {color}; font-size: 11px; font-weight: 600;")
-
-        if state != self._state:
-            self._state = state
-            self.setWindowIcon(state_icon(state))
-
-        # Cabecera de texto del preview (titulo de la ventana).
-        caption = repo
-        if conv:
-            caption += f" — {conv}"
-        caption += f"  ·  {label}"
-        if waiting:
-            caption += f"  ·  {human_age(age)}"
-        if caption != self._caption:
-            self._caption = caption
-            self.setWindowTitle(caption)
-
-    def close_silently(self) -> None:
-        """Cierra el piloto sin que dispare 'clicked'."""
-        self._closing = True
-        self.close()
-
-    def changeEvent(self, event) -> None:
-        # Al quitarse el estado 'minimizado' (el usuario clico su boton en la
-        # barra de tareas) avisamos para saltar a la terminal de la sesion.
-        if event.type() == QEvent.WindowStateChange:
-            if not self._closing and not (self.windowState() & Qt.WindowMinimized):
-                self.clicked.emit()
-        super().changeEvent(event)
-
-
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -729,32 +822,9 @@ class MainWindow(QWidget):
         self.resize(340, 400)
         self.setStyleSheet("background: #1e272e;")
 
-        # Modo Split (persistente): al minimizar, una lucecita por sesion en
-        # la barra de tareas en vez de un unico icono.
-        self.split_enabled = bool(load_settings().get("split", False))
-        # Pilotos vivos (session_id -> PilotWindow) y si estamos en esa vista.
-        self.pilots: dict[str, PilotWindow] = {}
-        self._in_split_view = False
-        # Ultima instantanea de sesiones (dicts) para los pilotos.
-        self._session_snapshot: list[dict] = []
-
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-
-        # Cabecera con el boton Split alineado a la derecha.
-        header = QHBoxLayout()
-        header.setContentsMargins(10, 8, 8, 4)
-        header.setSpacing(6)
-        header.addStretch()
-        self.split_btn = QPushButton("Split")
-        self.split_btn.setCheckable(True)
-        self.split_btn.setCursor(Qt.PointingHandCursor)
-        self.split_btn.setChecked(self.split_enabled)
-        self.split_btn.clicked.connect(self.toggle_split)
-        self._style_split_btn()
-        header.addWidget(self.split_btn)
-        root.addLayout(header)
 
         self.empty = QLabel("  Sin sesiones activas")
         self.empty.setStyleSheet("color: #636e72; font-size: 12px; padding: 16px;")
@@ -876,6 +946,8 @@ class MainWindow(QWidget):
                 self.rows[sid] = row
                 # Al pulsar la estrella, alternar el favorito de ESTA sesion.
                 row.fav_toggled.connect(lambda s=sid: self.toggle_favorite(s))
+                # Clic simple en la fila -> saltar a la terminal de la sesion.
+                row.activated.connect(lambda s=sid: self.focus_session(s))
             row.update_from(data, stale, age, favorite=sid in self.favorites)
             # Reubicar en la posicion correcta (quitar y reinsertar).
             self.list_layout.removeWidget(row)
@@ -906,21 +978,11 @@ class MainWindow(QWidget):
         ]
         self.apply_overall_icon(overall_state(states))
 
-        # Instantanea para los pilotos del modo Split. Si estamos en esa
-        # vista (ventana minimizada), sincronizarlos con las sesiones actuales.
-        self._session_snapshot = [
-            {
-                "sid": sid,
-                "repo": data.get("project") or sid[:8],
-                "title": data.get("title") or "",
-                "state": ("gray" if stale else data.get("state", "gray")),
-                "pid": data.get("pid", 0),
-                "age": age,
-            }
-            for (_o, sid, data, stale, age) in active
-        ]
-        if self._in_split_view:
-            self._sync_pilots()
+    def focus_session(self, session_id: str) -> None:
+        """Clic en una fila: trae al frente la terminal (y pestana) de la sesion."""
+        row = self.rows.get(session_id)
+        if row is not None:
+            focus_terminal(row._pid, row._title, row._repo)
 
     def toggle_favorite(self, session_id: str) -> None:
         """Marca/desmarca una sesion como favorita y reordena al instante."""
@@ -929,101 +991,6 @@ class MainWindow(QWidget):
         else:
             self.favorites.add(session_id)
         self.refresh()
-
-    # ---- Modo Split ----------------------------------------------------
-
-    def _style_split_btn(self) -> None:
-        """Estilo del boton segun este activo (verde) o no (apagado)."""
-        if self.split_enabled:
-            css = (
-                "QPushButton { color: #1e272e; background: #2ecc71; border: none;"
-                " border-radius: 6px; padding: 4px 12px; font-size: 12px;"
-                " font-weight: 600; }"
-                "QPushButton:hover { background: #43d67f; }"
-            )
-            tip = ("Split activo: al minimizar veras una lucecita por sesion "
-                   "en la barra de tareas.")
-        else:
-            css = (
-                "QPushButton { color: #9aa5ad; background: #2c3a45; border: none;"
-                " border-radius: 6px; padding: 4px 12px; font-size: 12px;"
-                " font-weight: 600; }"
-                "QPushButton:hover { background: #35454f; color: #ecf0f1; }"
-            )
-            tip = ("Split: al minimizar, muestra una lucecita por sesion "
-                   "en la barra de tareas.")
-        self.split_btn.setStyleSheet(css)
-        self.split_btn.setToolTip(tip)
-
-    def toggle_split(self) -> None:
-        """Activa/desactiva el modo Split y lo guarda."""
-        self.split_enabled = self.split_btn.isChecked()
-        save_settings({"split": self.split_enabled})
-        self._style_split_btn()
-        # Si se apaga mientras estabamos en la vista de pilotos, retirarlos.
-        if not self.split_enabled and self._in_split_view:
-            self._exit_split_view()
-
-    def changeEvent(self, event) -> None:
-        # Con Split activo: al minimizar desplegamos los pilotos; al restaurar
-        # la ventana principal los retiramos. Diferido con singleShot para no
-        # manipular ventanas dentro del propio evento de cambio de estado.
-        if event.type() == QEvent.WindowStateChange:
-            minimized = bool(self.windowState() & Qt.WindowMinimized)
-            if minimized and self.split_enabled and not self._in_split_view:
-                QTimer.singleShot(0, self._enter_split_view)
-            elif not minimized and self._in_split_view:
-                self._exit_split_view()
-        super().changeEvent(event)
-
-    def _enter_split_view(self) -> None:
-        """Despliega un piloto (punto) por sesion en la barra de tareas.
-
-        No ocultamos la ventana principal: su boton minimizado sigue en la
-        barra y sirve para volver a la vista completa. Los puntos se suman.
-        """
-        if self._in_split_view or not self.split_enabled:
-            return
-        self._in_split_view = True
-        self._sync_pilots()
-
-    def _sync_pilots(self) -> None:
-        """Crea/actualiza/elimina pilotos para que coincidan con las sesiones."""
-        snapshot = self._session_snapshot
-        ids = {info["sid"] for info in snapshot}
-
-        for sid in list(self.pilots):
-            if sid not in ids:
-                self.pilots.pop(sid).close_silently()
-
-        for info in snapshot:
-            pilot = self.pilots.get(info["sid"])
-            if pilot is None:
-                pilot = PilotWindow(info)
-                pilot.clicked.connect(lambda p=pilot: self._on_pilot_clicked(p))
-                self.pilots[info["sid"]] = pilot
-            else:
-                pilot.apply(info)
-
-    def _on_pilot_clicked(self, pilot: "PilotWindow") -> None:
-        """Clic en un punto: salta a la terminal de esa sesion y deja el
-        punto de nuevo minimizado en la barra de tareas."""
-        focus_terminal(pilot.pid, getattr(pilot, "conv_title", ""),
-                       getattr(pilot, "repo_name", ""))
-        # Windows acaba de restaurar la ventanita (fuera de pantalla);
-        # devolverla a la barra de tareas.
-        QTimer.singleShot(
-            0, lambda: pilot.showMinimized() if not pilot._closing else None)
-
-    def _exit_split_view(self) -> None:
-        """Retira todos los pilotos (vuelta a la vista normal)."""
-        self._in_split_view = False
-        self._destroy_pilots()
-
-    def _destroy_pilots(self) -> None:
-        for pilot in self.pilots.values():
-            pilot.close_silently()
-        self.pilots.clear()
 
     def apply_overall_icon(self, state: str) -> None:
         """Actualiza el icono de la ventana/barra de tareas si cambio."""
@@ -1038,9 +1005,6 @@ class MainWindow(QWidget):
         Se invoca cuando una segunda instancia intenta abrirse: en vez de
         crear otra ventana, reactivamos esta.
         """
-        # Si estabamos en la vista de pilotos, cerrarlos antes de restaurar.
-        self._in_split_view = False
-        self._destroy_pilots()
         # Quitar el flag de minimizada conservando los demas estados.
         self.setWindowState(
             (self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive
