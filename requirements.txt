@@ -1,2 +1,3 @@
 PySide6>=6.11
 psutil>=7.0
+comtypes>=1.4  # Windows: saltar a la pestana correcta de Windows Terminal (UIA)

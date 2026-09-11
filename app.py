@@ -116,6 +116,86 @@ def _title_score(win_title: str, sess_title: str) -> int:
     return 0
 
 
+# --- Windows Terminal: seleccion de pestana via UI Automation (opcional) ---
+# En Windows Terminal varias pestanas comparten una ventana y su titulo solo
+# refleja la pestana ACTIVA; enfocar la ventana no basta para llegar a una
+# pestana en segundo plano. Con UI Automation (comtypes) seleccionamos la
+# pestana correcta. Si comtypes/UIA no esta disponible (p. ej. en el .exe
+# empaquetado), se omite y solo se enfoca la ventana (comportamiento previo).
+
+# Titulo que Claude Code fija en la pestana antes de que la conversacion tenga
+# titulo propio: sirve para localizar una sesion aun sin titulo.
+_CLAUDE_DEFAULT_TAB = "claude code"
+
+# Cache perezosa del objeto de UI Automation (COM).
+_uia_cache: dict = {"tried": False, "uia": None, "mod": None}
+
+
+def _get_uia():
+    """Devuelve (automation, modulo) de UI Automation, o (None, None)."""
+    if _uia_cache["tried"]:
+        return _uia_cache["uia"], _uia_cache["mod"]
+    _uia_cache["tried"] = True
+    if sys.platform == "win32":
+        try:
+            import comtypes.client
+            mod = comtypes.client.GetModule("UIAutomationCore.dll")
+            _uia_cache["uia"] = comtypes.client.CreateObject(
+                mod.CUIAutomation, interface=mod.IUIAutomation)
+            _uia_cache["mod"] = mod
+        except Exception:
+            pass
+    return _uia_cache["uia"], _uia_cache["mod"]
+
+
+def _select_wt_tab(hwnd, title: str) -> bool:
+    """Selecciona en la ventana 'hwnd' la pestana de la sesion, si procede.
+
+    Busca la pestana (TabItem de UIA) cuyo titulo casa con el de la
+    conversacion y la activa. Si la sesion aun no tiene titulo, cae a la
+    pestana por defecto de Claude ("Claude Code") solo si es unica. En
+    ventanas sin pestanas (consola clasica) o sin UIA no hace nada.
+
+    Devuelve True si selecciono una pestana.
+    """
+    uia, mod = _get_uia()
+    if uia is None or not hwnd:
+        return False
+    try:
+        el = uia.ElementFromHandle(hwnd)
+        cond = uia.CreatePropertyCondition(
+            mod.UIA_ControlTypePropertyId, mod.UIA_TabItemControlTypeId)
+        found = el.FindAll(mod.TreeScope_Descendants, cond)
+        tabs = [(found.GetElement(i).CurrentName or "", found.GetElement(i))
+                for i in range(found.Length)]
+    except Exception:
+        return False
+    if not tabs:
+        return False
+
+    target = None
+    if _norm_title(title):
+        best = 0
+        for name, elem in tabs:
+            score = _title_score(name, title)
+            if score > best:
+                best, target = score, elem
+    else:
+        # Sesion sin titulo: su pestana se llama "Claude Code" (unica).
+        defaults = [elem for name, elem in tabs
+                    if _norm_title(name) == _CLAUDE_DEFAULT_TAB]
+        if len(defaults) == 1:
+            target = defaults[0]
+    if target is None:
+        return False
+    try:
+        pat = target.GetCurrentPattern(mod.UIA_SelectionItemPatternId)
+        pat.QueryInterface(mod.IUIAutomationSelectionItemPattern).Select()
+        return True
+    except Exception:
+        return False
+
+
 def focus_terminal(pid: int, title: str = "", repo: str = "") -> bool:
     """Trae al frente la ventana de la terminal de una sesion de Claude Code.
 
@@ -225,6 +305,9 @@ def _focus_terminal_win(pid: int, title: str, repo: str) -> bool:
             if score > best_score:
                 best_score, best = score, hwnd
         if best is not None:
+            # Windows Terminal: seleccionar la pestana correcta (aunque este
+            # en segundo plano) antes de enfocar la ventana.
+            _select_wt_tab(best, title)
             return focus(best)
 
     # --- 2) Consola clasica via AttachConsole ----------------------------
@@ -258,7 +341,10 @@ def _focus_terminal_win(pid: int, title: str, repo: str) -> bool:
         if len(terms) == 1:
             target = terms[0]
 
-    return focus(target) if target else False
+    if target:
+        _select_wt_tab(target, title)
+        return focus(target)
+    return False
 
 
 from PySide6.QtCore import Qt, QTimer, QRectF, Signal, QEvent
@@ -464,6 +550,10 @@ class StarButton(QLabel):
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
             self.clicked.emit()
+            # Consumir el evento: no debe propagarse a la fila (que abriria la
+            # terminal). La estrella solo alterna la favorita.
+            event.accept()
+            return
         super().mousePressEvent(event)
 
 
@@ -489,14 +579,28 @@ class SessionRow(QWidget):
     """Una fila: luz + (repo / titulo de conversacion) + estado + tiempo + estrella."""
 
     fav_toggled = Signal()
+    activated = Signal()  # clic simple: ir a la terminal de esta sesion
 
     def __init__(self):
         super().__init__()
         self.setObjectName("row")
         # Seguir el raton para mostrar la estrella al hacer hover.
         self.setAttribute(Qt.WA_Hover, True)
-        # Toda la fila es clicable (doble clic = favorita) -> cursor de mano.
+        # Toda la fila es clicable (clic = terminal, doble clic = favorita).
         self.setCursor(Qt.PointingHandCursor)
+
+        # Datos de la sesion para localizar su terminal al hacer clic.
+        self._pid = 0
+        self._title = ""
+        self._repo = ""
+        # Distinguir clic simple de doble: al soltar arrancamos un temporizador
+        # con el intervalo de doble clic del sistema; si llega un doble clic lo
+        # cancelamos. Si expira, fue un clic simple de verdad -> abrir terminal.
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.timeout.connect(self.activated)
+        self._suppress_next_release = False
+
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 8, 8, 8)
         layout.setSpacing(10)
@@ -555,9 +659,23 @@ class SessionRow(QWidget):
         self.star.set_row_hover(False)
         super().leaveEvent(event)
 
+    def mouseReleaseEvent(self, event) -> None:
+        # Candidato a clic simple: esperar el intervalo de doble clic antes de
+        # dar la accion por buena, por si es la primera mitad de un doble clic.
+        if event.button() == Qt.LeftButton:
+            if self._suppress_next_release:
+                # Este release es la segunda mitad de un doble clic ya tratado.
+                self._suppress_next_release = False
+            else:
+                self._click_timer.start(QApplication.doubleClickInterval())
+        super().mouseReleaseEvent(event)
+
     def mouseDoubleClickEvent(self, event) -> None:
         # Doble clic en cualquier parte de la fila -> marcar/desmarcar favorita.
         if event.button() == Qt.LeftButton:
+            # Cancelar el clic simple pendiente y no abrir la terminal.
+            self._click_timer.stop()
+            self._suppress_next_release = True
             self.fav_toggled.emit()
         super().mouseDoubleClickEvent(event)
 
@@ -566,11 +684,20 @@ class SessionRow(QWidget):
         state = data.get("state", "gray")
         if stale:
             state = "gray"
+        try:
+            self._pid = int(data.get("pid") or 0)
+        except (TypeError, ValueError):
+            self._pid = 0
         self.dot.set_color(COLORS.get(state, COLORS["gray"]))
         self.star.set_favorite(favorite)
 
-        self.repo.setText(data.get("project") or data.get("session_id", "?")[:8])
+        repo = data.get("project") or data.get("session_id", "?")[:8]
+        self.repo.setText(repo)
         title = data.get("title", "") or ""
+        # Pistas para localizar la terminal al hacer clic (la terminal titula
+        # la pestana/ventana con el titulo de la conversacion).
+        self._repo = repo
+        self._title = title
         self.title.setText(title)
         self.title.setVisible(bool(title))
 
@@ -876,6 +1003,8 @@ class MainWindow(QWidget):
                 self.rows[sid] = row
                 # Al pulsar la estrella, alternar el favorito de ESTA sesion.
                 row.fav_toggled.connect(lambda s=sid: self.toggle_favorite(s))
+                # Clic simple en la fila -> saltar a la terminal de la sesion.
+                row.activated.connect(lambda s=sid: self.focus_session(s))
             row.update_from(data, stale, age, favorite=sid in self.favorites)
             # Reubicar en la posicion correcta (quitar y reinsertar).
             self.list_layout.removeWidget(row)
@@ -921,6 +1050,12 @@ class MainWindow(QWidget):
         ]
         if self._in_split_view:
             self._sync_pilots()
+
+    def focus_session(self, session_id: str) -> None:
+        """Clic en una fila: trae al frente la terminal (y pestana) de la sesion."""
+        row = self.rows.get(session_id)
+        if row is not None:
+            focus_terminal(row._pid, row._title, row._repo)
 
     def toggle_favorite(self, session_id: str) -> None:
         """Marca/desmarca una sesion como favorita y reordena al instante."""
